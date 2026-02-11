@@ -3,6 +3,22 @@ $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $VenvPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+$VersionFile = Join-Path $ProjectRoot "VERSION"
+
+if (-not (Test-Path $VersionFile)) {
+    Set-Content -Path $VersionFile -Value "v0.9.0" -Encoding utf8
+}
+
+$CurrentVersion = (Get-Content -Path $VersionFile -Raw).Trim()
+if ($CurrentVersion -notmatch '^v(\d+)\.(\d+)\.(\d+)$') {
+    throw "Invalid VERSION format: $CurrentVersion. Expected v<major>.<minor>.<patch>"
+}
+
+$Major = [int]$Matches[1]
+$Minor = [int]$Matches[2]
+$Patch = [int]$Matches[3]
+$BuildVersion = $CurrentVersion
+$NextVersion = "v$Major.$Minor.$($Patch + 1)"
 
 if (-not (Test-Path $VenvPython)) {
     & (Join-Path $ProjectRoot "bootstrap.ps1")
@@ -37,6 +53,14 @@ if (-not (Test-Path (Join-Path $DistDir "ResumeMailer"))) {
 }
 
 Copy-Item -Recurse -Force (Join-Path $DistDir "ResumeMailer") $ReleaseDir
+$PrimaryExe = Join-Path $ReleaseDir "ResumeMailer.exe"
+$DirectDownloadExe = Join-Path $ReleaseRoot "ResumeMailer.exe"
+Copy-Item -Force $PrimaryExe $DirectDownloadExe
+Set-Content -Path (Join-Path $ReleaseRoot "VERSION.txt") -Value $BuildVersion -Encoding utf8
+Set-Content -Path $VersionFile -Value $NextVersion -Encoding utf8
 
 Write-Host "Build complete."
 Write-Host "EXE: $(Join-Path $ReleaseDir 'ResumeMailer.exe')"
+Write-Host "Direct EXE: $DirectDownloadExe"
+Write-Host "Built version: $BuildVersion"
+Write-Host "Next version: $NextVersion"
