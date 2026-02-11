@@ -1,6 +1,7 @@
 import json
 import re
 import secrets
+import shutil
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -17,10 +18,12 @@ APP_NAME = "伊蓮娜的煩惱"
 APP_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = APP_DIR.parent
 RUNTIME_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else PROJECT_DIR
-LOG_DIR = RUNTIME_DIR / "logs"
-OUTBOX_DIR = RUNTIME_DIR / "outbox"
+
 CONFIG_PATH = RUNTIME_DIR / "config.json"
+LOG_DIR = RUNTIME_DIR / "logs"
 AUDIT_LOG_PATH = LOG_DIR / "audit.jsonl"
+UPLOAD_DIR = RUNTIME_DIR / "uploads"
+OUTBOX_DIR = RUNTIME_DIR / "outbox"
 
 SPLASH_IMAGE_REL = Path("photo") / "elena.png"
 SPLASH_MS = 1800
@@ -48,6 +51,7 @@ def resource_path(relative_path: Path) -> Path:
 
 def ensure_dirs() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -101,6 +105,17 @@ def generate_password_8_digits() -> str:
     return "".join(str(secrets.randbelow(10)) for _ in range(8))
 
 
+def stage_uploaded_file(input_file: Path) -> Path:
+    ensure_dirs()
+    if not input_file.exists():
+        raise FileNotFoundError(f"File not found: {input_file}")
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", input_file.stem)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    staged_path = UPLOAD_DIR / f"{safe_stem}_{ts}{input_file.suffix}"
+    shutil.copy2(input_file, staged_path)
+    return staged_path
+
+
 def create_protected_zip(input_file: Path, password: str) -> Path:
     ensure_dirs()
     if not input_file.exists():
@@ -136,13 +151,13 @@ def verify_protected_zip(zip_path: Path, password: str, expected_member: str) ->
             raise RuntimeError("ZIP integrity check failed.")
 
 
-def cleanup_old_outbox(days: int = 7) -> None:
+def cleanup_old_dir_files(base_dir: Path, days: int = 7) -> None:
     ensure_dirs()
     now = datetime.now().timestamp()
     max_age_seconds = days * 24 * 60 * 60
-    for path in OUTBOX_DIR.glob("*.zip"):
+    for path in base_dir.glob("*"):
         try:
-            if now - path.stat().st_mtime > max_age_seconds:
+            if path.is_file() and now - path.stat().st_mtime > max_age_seconds:
                 path.unlink(missing_ok=True)
         except Exception:
             pass
@@ -184,35 +199,31 @@ class OutlookMailer:
         self._account_map: dict[str, object] = {}
 
     def list_accounts(self) -> list[str]:
-        results: list[str] = []
+        labels: list[str] = []
         self._account_map = {}
         for i in range(1, self.ns.Accounts.Count + 1):
             account = self.ns.Accounts.Item(i)
-            smtp = getattr(account, "SmtpAddress", None)
-            display_name = str(account.DisplayName or "").strip()
-            smtp_str = str(smtp or "").strip()
-            base_label = smtp_str if smtp_str else display_name if display_name else f"Account {i}"
-            label = base_label
-            suffix = 2
+            smtp = str(getattr(account, "SmtpAddress", "") or "").strip()
+            display_name = str(getattr(account, "DisplayName", "") or "").strip()
+            base = smtp if smtp else display_name if display_name else f"Account {i}"
+            label = base
+            idx = 2
             while label in self._account_map:
-                label = f"{base_label} ({suffix})"
-                suffix += 1
+                label = f"{base} ({idx})"
+                idx += 1
             self._account_map[label] = account
-            results.append(label)
-        return results
+            labels.append(label)
+        return labels
 
     def get_account_by_label(self, account_label: str):
         return self._account_map.get(account_label)
 
     def _apply_send_account(self, mail, account) -> None:
-        # Primary path.
         mail.SendUsingAccount = account
-        # Fallback for Outlook builds where direct property set is flaky.
         try:
             mail._oleobj_.Invoke(*(64209, 0, 8, 0, account))
         except Exception:
             pass
-
         smtp = str(getattr(account, "SmtpAddress", "") or "").strip()
         if smtp:
             try:
@@ -228,10 +239,11 @@ class OutlookMailer:
         body: str,
         attachment: Path | None = None,
     ) -> None:
-        mail = self.app.CreateItem(0)
         account = self.get_account_by_label(sender_label)
         if account is None:
             raise RuntimeError(f"Sender account not found: {sender_label}")
+
+        mail = self.app.CreateItem(0)
         self._apply_send_account(mail, account)
         mail.To = to
         mail.Subject = subject
@@ -247,15 +259,15 @@ class ResumeMailerApp:
         self.root.title(APP_NAME)
         self.root.geometry("760x700")
         self.root.minsize(680, 620)
+
         self.config = load_config()
+        self.mailer: OutlookMailer | None = None
+        self.accounts: list[str] = []
 
         self.resume_var = StringVar()
         self.to_var = StringVar()
         self.sender_var = StringVar()
         self.status_var = StringVar(value="Ready")
-
-        self.mailer: OutlookMailer | None = None
-        self.accounts: list[str] = []
 
         self._build_ui()
         self._init_outlook()
@@ -265,8 +277,6 @@ class ResumeMailerApp:
         frame = ttk.Frame(self.root, padding=12)
         frame.pack(fill=tk.BOTH, expand=True)
         frame.columnconfigure(1, weight=1)
-        frame.rowconfigure(6, weight=1)
-        frame.rowconfigure(8, weight=1)
 
         ttk.Label(frame, text="履歷檔案").grid(row=0, column=0, sticky=tk.W, pady=4)
         ttk.Entry(frame, textvariable=self.resume_var).grid(row=0, column=1, sticky=tk.EW, pady=4)
@@ -278,9 +288,7 @@ class ResumeMailerApp:
         ttk.Label(frame, text="寄件帳號").grid(row=2, column=0, sticky=tk.W, pady=4)
         self.sender_combo = ttk.Combobox(frame, textvariable=self.sender_var, state="readonly")
         self.sender_combo.grid(row=2, column=1, sticky=tk.EW, pady=4)
-        ttk.Button(frame, text="重新整理帳號", command=self.refresh_accounts).grid(
-            row=2, column=2, padx=6, pady=4
-        )
+        ttk.Button(frame, text="重新整理帳號", command=self.refresh_accounts).grid(row=2, column=2, padx=6, pady=4)
 
         ttk.Label(frame, text="第一封主旨").grid(row=3, column=0, sticky=tk.W, pady=4)
         self.subject1_entry = ttk.Entry(frame)
@@ -298,10 +306,10 @@ class ResumeMailerApp:
         self.body2_text = tk.Text(frame, height=8)
         self.body2_text.grid(row=6, column=1, columnspan=2, sticky=tk.EW, pady=4)
 
-        buttons = ttk.Frame(frame)
-        buttons.grid(row=7, column=0, columnspan=3, sticky=tk.EW, pady=10)
-        ttk.Button(buttons, text="寄送兩封信", command=self.on_send).pack(side=tk.LEFT, padx=4)
-        ttk.Button(buttons, text="儲存模板設定", command=self.on_save_templates).pack(side=tk.LEFT, padx=4)
+        action_frame = ttk.Frame(frame)
+        action_frame.grid(row=7, column=0, columnspan=3, sticky=tk.W, pady=10)
+        ttk.Button(action_frame, text="寄送兩封信", command=self.on_send).pack(side=tk.LEFT, padx=4)
+        ttk.Button(action_frame, text="儲存模板設定", command=self.on_save_templates).pack(side=tk.LEFT, padx=4)
 
         ttk.Label(frame, textvariable=self.status_var).grid(row=8, column=0, columnspan=3, sticky=tk.W, pady=6)
 
@@ -345,32 +353,35 @@ class ResumeMailerApp:
         self.config.default_sender = self.sender_var.get().strip()
         save_config(self.config)
         self.status_var.set("模板與預設寄件帳號已儲存")
-        messagebox.showinfo("完成", "設定已儲存。")
+        messagebox.showinfo("完成", "設定已儲存")
 
     def _validate(self) -> tuple[Path, str, str]:
         if self.mailer is None:
-            raise RuntimeError("Outlook 未初始化成功。")
+            raise RuntimeError("Outlook 未初始化成功")
         resume_path = Path(self.resume_var.get().strip())
         recipient = self.to_var.get().strip()
         sender = self.sender_var.get().strip()
         if not resume_path.exists():
-            raise ValueError("請先選擇有效的履歷檔案。")
+            raise ValueError("請先選擇有效的履歷檔案")
         if not is_valid_email(recipient):
-            raise ValueError("收件人格式不合法。")
+            raise ValueError("收件人格式不合法")
         if sender not in self.accounts:
-            raise ValueError("請選擇有效的寄件帳號。")
+            raise ValueError("請選擇有效的寄件帳號")
         return resume_path, recipient, sender
 
     def on_send(self) -> None:
+        staged_resume_path = None
+        zip_path = None
         started_at = datetime.now().isoformat(timespec="seconds")
         try:
             resume_path, recipient, sender = self._validate()
-            self.status_var.set("處理中：建立加密壓縮檔...")
+            self.status_var.set("處理中：建立暫存檔與加密壓縮...")
             self.root.update_idletasks()
 
+            staged_resume_path = stage_uploaded_file(resume_path)
             password = generate_password_8_digits()
-            zip_path = create_protected_zip(resume_path, password)
-            verify_protected_zip(zip_path, password, resume_path.name)
+            zip_path = create_protected_zip(staged_resume_path, password)
+            verify_protected_zip(zip_path, password, staged_resume_path.name)
 
             subject_1 = self.subject1_entry.get().strip()
             body_1 = self.body1_text.get("1.0", END).strip()
@@ -378,11 +389,11 @@ class ResumeMailerApp:
             body_2_template = self.body2_text.get("1.0", END).strip()
             body_2 = body_2_template.replace("{password}", password)
 
-            self.status_var.set("處理中：寄送第一封（附件信）...")
+            self.status_var.set("處理中：寄送第一封（附件信）")
             self.root.update_idletasks()
             self.mailer.send_mail(sender, recipient, subject_1, body_1, zip_path)
 
-            self.status_var.set("處理中：寄送第二封（密碼信）...")
+            self.status_var.set("處理中：寄送第二封（密碼信）")
             self.root.update_idletasks()
             try:
                 self.mailer.send_mail(sender, recipient, subject_2, body_2, None)
@@ -396,7 +407,6 @@ class ResumeMailerApp:
                         "error": str(e2),
                     }
                 )
-                self.status_var.set("第二封寄送失敗")
                 retry = messagebox.askyesno("第二封失敗", f"第二封寄送失敗：\n{e2}\n\n是否重送第二封？")
                 if retry:
                     self.mailer.send_mail(sender, recipient, subject_2, body_2, None)
@@ -420,7 +430,7 @@ class ResumeMailerApp:
                 }
             )
             self.status_var.set("完成：兩封信已送出")
-            messagebox.showinfo("完成", "兩封信已送出。")
+            messagebox.showinfo("完成", "兩封信已送出。暫存檔已清除")
         except Exception as e:
             append_audit(
                 {
@@ -433,11 +443,20 @@ class ResumeMailerApp:
             )
             self.status_var.set("失敗")
             messagebox.showerror("錯誤", str(e))
+        finally:
+            # Security policy: remove staged files after each send attempt.
+            for path in (zip_path, staged_resume_path):
+                try:
+                    if path and Path(path).exists():
+                        Path(path).unlink(missing_ok=True)
+                except Exception:
+                    pass
 
 
 def main() -> None:
     ensure_dirs()
-    cleanup_old_outbox()
+    cleanup_old_dir_files(UPLOAD_DIR, days=7)
+    cleanup_old_dir_files(OUTBOX_DIR, days=7)
 
     root = Tk()
     root.withdraw()

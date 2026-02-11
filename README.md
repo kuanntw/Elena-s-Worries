@@ -30,7 +30,10 @@ Windows 履歷寄送工具。透過本機 Outlook 自動寄出兩封信：
 程式會存到 EXE 同目錄：
 - `config.json`: `<exe-folder>\config.json`
 - `audit.jsonl`: `<exe-folder>\logs\audit.jsonl`
-- 寄送用 zip 暫存：`<exe-folder>\outbox\`
+- 上傳檔案暫存：`<exe-folder>\uploads\`
+- 壓縮檔暫存：`<exe-folder>\outbox\`
+
+寄送流程會在每次送件後自動清除本次暫存檔（`uploads` 與 `outbox`）。
 
 ## 必要條件
 - Windows 10/11
