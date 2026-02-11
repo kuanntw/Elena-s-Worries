@@ -1,0 +1,3 @@
+pywin32==311
+pyzipper==0.3.6
+pyinstaller==6.16.0
